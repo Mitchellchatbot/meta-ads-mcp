@@ -1,4 +1,5 @@
 import express from "express";
+import cors from "cors";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import {
@@ -427,10 +428,32 @@ function createMCPServer() {
 // ─── Express server ───────────────────────────────────────────────────────────
 
 const app = express();
+
+// Allow requests from Claude.ai and any other origin (MCP clients)
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "mcp-session-id"],
+    exposedHeaders: ["mcp-session-id"],
+  })
+);
+app.options("*", cors()); // Handle preflight requests
+
 app.use(express.json());
 
 // Store active SSE transports by session ID
 const transports = new Map<string, SSEServerTransport>();
+
+// Root — useful sanity check
+app.get("/", (_req, res) => {
+  res.json({
+    service: "meta-ads-mcp",
+    version: "1.0.0",
+    status: "running",
+    endpoints: { sse: "/sse", messages: "/messages", health: "/health" },
+  });
+});
 
 // Health check
 app.get("/health", (_req, res) => {
@@ -440,6 +463,12 @@ app.get("/health", (_req, res) => {
 // SSE endpoint — Claude.ai connects here
 app.get("/sse", async (req, res) => {
   console.log("New SSE connection from", req.ip);
+
+  // Required SSE headers
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // Disable Nginx buffering on Railway
 
   const transport = new SSEServerTransport("/messages", res);
   transports.set(transport.sessionId, transport);
