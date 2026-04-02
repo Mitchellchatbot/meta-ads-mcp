@@ -1,7 +1,9 @@
 import express from "express";
 import cors from "cors";
+import { randomUUID } from "crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -433,66 +435,111 @@ const app = express();
 app.use(
   cors({
     origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
+    methods: ["GET", "POST", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization", "mcp-session-id"],
     exposedHeaders: ["mcp-session-id"],
   })
 );
-app.options("*", cors()); // Handle preflight requests
+app.options("*", cors());
 
 app.use(express.json());
 
-// Store active SSE transports by session ID
-const transports = new Map<string, SSEServerTransport>();
+// ─── Streamable HTTP transport (new protocol — Claude.ai web) ─────────────────
 
-// Root — useful sanity check
-app.get("/", (_req, res) => {
-  res.json({
-    service: "meta-ads-mcp",
-    version: "1.0.0",
-    status: "running",
-    endpoints: { sse: "/sse", messages: "/messages", health: "/health" },
+interface MCPSession {
+  transport: StreamableHTTPServerTransport;
+  server: Server;
+}
+const mcpSessions = new Map<string, MCPSession>();
+
+app.all("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+  // Reuse existing session
+  if (sessionId && mcpSessions.has(sessionId)) {
+    const session = mcpSessions.get(sessionId)!;
+    await session.transport.handleRequest(req, res, req.body);
+    return;
+  }
+
+  // Only POST can start a new session
+  if (req.method !== "POST") {
+    res.status(404).json({ error: "No active session. Send a POST to /mcp to initialise." });
+    return;
+  }
+
+  console.log("New Streamable HTTP session from", req.ip);
+
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: (newId) => {
+      mcpSessions.set(newId, { transport, server: mcpServer });
+      console.log("Session initialised:", newId);
+    },
   });
+
+  transport.onclose = () => {
+    if (transport.sessionId) {
+      mcpSessions.delete(transport.sessionId);
+      console.log("Session closed:", transport.sessionId);
+    }
+  };
+
+  const mcpServer = createMCPServer();
+  await mcpServer.connect(transport);
+  await transport.handleRequest(req, res, req.body);
 });
 
-// Health check
-app.get("/health", (_req, res) => {
-  res.json({ status: "ok", service: "meta-ads-mcp" });
-});
+// ─── Legacy SSE transport (older MCP clients) ─────────────────────────────────
 
-// SSE endpoint — Claude.ai connects here
+const sseTransports = new Map<string, SSEServerTransport>();
+
 app.get("/sse", async (req, res) => {
   console.log("New SSE connection from", req.ip);
 
-  // Required SSE headers
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no"); // Disable Nginx buffering on Railway
+  res.setHeader("X-Accel-Buffering", "no");
 
   const transport = new SSEServerTransport("/messages", res);
-  transports.set(transport.sessionId, transport);
+  sseTransports.set(transport.sessionId, transport);
 
   res.on("close", () => {
-    console.log("SSE connection closed:", transport.sessionId);
-    transports.delete(transport.sessionId);
+    sseTransports.delete(transport.sessionId);
   });
 
   const server = createMCPServer();
   await server.connect(transport);
 });
 
-// Message endpoint — Claude.ai posts tool calls here
 app.post("/messages", async (req, res) => {
   const sessionId = req.query.sessionId as string;
-  const transport = transports.get(sessionId);
-
+  const transport = sseTransports.get(sessionId);
   if (!transport) {
     res.status(404).json({ error: "Session not found" });
     return;
   }
-
   await transport.handlePostMessage(req, res);
+});
+
+// ─── Utility endpoints ────────────────────────────────────────────────────────
+
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", service: "meta-ads-mcp" });
+});
+
+app.get("/", (_req, res) => {
+  res.json({
+    service: "meta-ads-mcp",
+    version: "1.0.0",
+    status: "running",
+    endpoints: {
+      mcp: "/mcp  (Streamable HTTP — Claude.ai web)",
+      sse: "/sse  (legacy SSE transport)",
+      health: "/health",
+    },
+  });
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
